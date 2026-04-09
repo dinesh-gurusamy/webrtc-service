@@ -33,31 +33,58 @@ function generateCode() {
 }
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('AudioSheet Signaling Server — Multi-Listener Edition');
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status: 'ok',
+    server: 'AudioSheet Signaling Server — Multi-Listener Edition',
+    sessions: sessions.size,
+    uptime: process.uptime(),
+  }));
 });
 
-const wss = new WebSocketServer({ server });
+// Accept connections on /myapp path (matches client URL) and also on any path
+const wss = new WebSocketServer({ server, path: '/myapp' });
+
+// ── Server-side heartbeat: detect dead connections ──────────────────────────
+const HEARTBEAT_INTERVAL = 30000; // 30 seconds
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log(`[HEARTBEAT] Terminating dead connection (role: ${ws.role}, session: ${ws.sessionCode})`);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping(); // ws library sends a native ping frame
+  });
+}, HEARTBEAT_INTERVAL);
+
+wss.on('close', () => clearInterval(heartbeat));
 
 wss.on('connection', (ws) => {
+  ws.isAlive = true;
   ws.sessionCode = null;
   ws.role = null;
   ws.listenerId = null;
 
+  // Native pong response marks connection as alive
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (raw) => {
     let msg;
     try { 
-      // Multi-environment safety: Ensure raw is a string
       msg = JSON.parse(raw.toString()); 
     } catch {
       ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
       return;
     }
 
+    // Application-level ping from client also marks alive
+    if (msg.type === 'ping') {
+      ws.isAlive = true;
+      return;
+    }
+
     switch (msg.type) {
-      case 'ping':
-        // Keep-alive: Server doesn't need to do anything, just received it
-        break;
 
       // ── HOST creates a session ───────────────────────────────────────────
       case 'host:create': {
@@ -66,16 +93,17 @@ wss.on('connection', (ws) => {
         ws.sessionCode = code;
         ws.role = 'host';
         ws.send(JSON.stringify({ type: 'host:created', code }));
-        console.log(`[${code}] Host created session`);
+        console.log(`[${code}] Host created session (${sessions.size} total sessions)`);
         break;
       }
 
       // ── LISTENER joins with a code ───────────────────────────────────────
       case 'listener:join': {
-        const { code } = msg;
+        const code = (msg.code || '').toUpperCase();
         const session = sessions.get(code);
         if (!session) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Invalid code. Session not found.' }));
+          console.log(`[MISS] Listener tried code "${code}" — not found. Active sessions: [${[...sessions.keys()].join(', ')}]`);
+          ws.send(JSON.stringify({ type: 'error', message: 'Session not found. Invalid code.' }));
           return;
         }
         const listenerId = String(nextListenerId++);
@@ -91,6 +119,9 @@ wss.on('connection', (ws) => {
         // Tell host to create a dedicated offer for this listener
         if (session.hostWs?.readyState === 1) {
           session.hostWs.send(JSON.stringify({ type: 'listener:request', listenerId }));
+          console.log(`[${code}] Forwarded listener:request to host for listener ${listenerId}`);
+        } else {
+          console.log(`[${code}] WARNING: Host WS not open (state: ${session.hostWs?.readyState}), cannot forward listener:request`);
         }
         break;
       }
@@ -107,6 +138,8 @@ wss.on('connection', (ws) => {
             iceCandidates: msg.iceCandidates || [],
           }));
           console.log(`[${ws.sessionCode}] Offer forwarded to listener ${msg.listenerId}`);
+        } else {
+          console.log(`[${ws.sessionCode}] WARNING: Listener ${msg.listenerId} WS not open, offer dropped`);
         }
         break;
       }
@@ -170,7 +203,7 @@ wss.on('connection', (ws) => {
           lws.send(JSON.stringify({ type: 'session:closed', reason: 'Host disconnected' }));
       });
       sessions.delete(ws.sessionCode);
-      console.log(`[${ws.sessionCode}] Host disconnected — session removed`);
+      console.log(`[${ws.sessionCode}] Host disconnected — session removed (${sessions.size} remaining)`);
     } else if (ws.role === 'listener') {
       session.listeners.delete(ws.listenerId);
       console.log(`[${ws.sessionCode}] Listener ${ws.listenerId} left (${session.listeners.size} remaining)`);
@@ -184,5 +217,6 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, () => {
   console.log(`🚀 Signaling server running on port ${PORT}`);
-  console.log(`   WebSocket: ws://localhost:${PORT}`);
-});
+  console.log(`   WebSocket: ws://localhost:${PORT}/myapp`);
+  console.log(`   Health:    http://localhost:${PORT}/`);
+});
