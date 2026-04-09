@@ -46,12 +46,18 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch {
+    try { 
+      // Multi-environment safety: Ensure raw is a string
+      msg = JSON.parse(raw.toString()); 
+    } catch {
       ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
       return;
     }
 
     switch (msg.type) {
+      case 'ping':
+        // Keep-alive: Server doesn't need to do anything, just received it
+        break;
 
       // ── HOST creates a session ───────────────────────────────────────────
       case 'host:create': {
@@ -118,6 +124,23 @@ wss.on('connection', (ws) => {
           }));
           console.log(`[${ws.sessionCode}] Answer from listener ${msg.listenerId} forwarded to host`);
         }
+        break;
+      }
+
+      // ── HOST sends a broadcast (command) to all listeners ────────────────
+      case 'host:broadcast': {
+        const session = sessions.get(ws.sessionCode);
+        if (!session || ws.role !== 'host') return;
+        
+        session.listeners.forEach((lws, lid) => {
+          if (lws.readyState === 1) {
+            lws.send(JSON.stringify({ 
+              type: 'listener:broadcast', 
+              payload: msg.payload 
+            }));
+          }
+        });
+        console.log(`[${ws.sessionCode}] Broadcast forwarded to ${session.listeners.size} listeners`);
         break;
       }
 
